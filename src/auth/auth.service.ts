@@ -1,0 +1,222 @@
+// src/auth/auth.service.ts
+import {
+  Injectable,
+  BadRequestException,
+  UnauthorizedException,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../prisma/prisma.service';
+import { MailService } from '../mail/mail.service';
+import { SendOtpDto, VerifyOtpDto } from './dto/auth.dto';
+
+@Injectable()
+export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private jwt: JwtService,
+    private config: ConfigService,
+    private mail: MailService,
+  ) {}
+
+  // ─── Génération OTP 6 chiffres ────────────────────────────────────────────
+  private generateOtp(): string {
+    return Math.floor(100000 + Math.random() * 900000).toString();
+  }
+
+  // ─── Envoi de l'OTP ───────────────────────────────────────────────────────
+  async sendOtp(dto: SendOtpDto): Promise<{ message: string; expiresIn: number }> {
+    const { email, language = 'fr' } = dto;
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Vérifier les tentatives (anti-spam)
+    const existing = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      select: { otpAttempts: true, otpExpiresAt: true, otpCode: true },
+    });
+
+    if (existing?.otpAttempts >= 5 && existing?.otpExpiresAt && existing.otpExpiresAt > new Date()) {
+      throw new HttpException(
+        'Trop de tentatives. Veuillez réessayer dans 10 minutes.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // Générer OTP
+    const otpCode = this.generateOtp();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Upsert user (crée si n'existe pas encore)
+    await this.prisma.user.upsert({
+      where: { email: normalizedEmail },
+      create: {
+        email: normalizedEmail,
+        otpCode,
+        otpExpiresAt: expiresAt,
+        otpAttempts: 0,
+        language,
+      },
+      update: {
+        otpCode,
+        otpExpiresAt: expiresAt,
+        otpAttempts: 0,
+        language,
+      },
+    });
+
+    // Envoyer l'email
+    await this.mail.sendOtp(normalizedEmail, otpCode, language);
+
+    this.logger.log(`OTP envoyé à ${normalizedEmail}`);
+
+    return {
+      message: 'Code OTP envoyé par email',
+      expiresIn: 600, // secondes
+    };
+  }
+
+  // ─── Vérification OTP ─────────────────────────────────────────────────────
+  async verifyOtp(dto: VerifyOtpDto) {
+    const { email, code } = dto;
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const user = await this.prisma.user.findUnique({
+      where: { email: normalizedEmail },
+      include: { driver: true },
+    });
+
+    if (!user) {
+      throw new BadRequestException('Aucun compte trouvé pour cet email');
+    }
+
+    // Vérifier expiration
+    if (!user.otpExpiresAt || user.otpExpiresAt < new Date()) {
+      throw new BadRequestException('Le code OTP a expiré. Veuillez en demander un nouveau.');
+    }
+
+    // Vérifier tentatives
+    const maxAttempts = Number(this.config.get('OTP_MAX_ATTEMPTS', 5));
+    if (user.otpAttempts >= maxAttempts) {
+      throw new HttpException(
+        'Trop de tentatives incorrectes. Demandez un nouveau code.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // Vérifier code
+    if (user.otpCode !== code) {
+      await this.prisma.user.update({
+        where: { email: normalizedEmail },
+        data: { otpAttempts: { increment: 1 } },
+      });
+      const remaining = maxAttempts - user.otpAttempts - 1;
+      throw new BadRequestException(
+        `Code incorrect. ${remaining} tentative(s) restante(s).`,
+      );
+    }
+
+    // ✅ OTP valide — marquer l'utilisateur comme vérifié
+    const isNewUser = !user.isVerified;
+
+    const updatedUser = await this.prisma.user.update({
+      where: { email: normalizedEmail },
+      data: {
+        isVerified: true,
+        otpCode: null,
+        otpExpiresAt: null,
+        otpAttempts: 0,
+      },
+    });
+
+    // Envoyer email bienvenue si premier login
+    if (isNewUser) {
+      await this.mail.sendWelcome(normalizedEmail, user.firstName ?? 'là', user.language);
+    }
+
+    // Générer tokens JWT
+    const tokens = await this.generateTokens(updatedUser.id, updatedUser.email, updatedUser.role);
+
+    // Sauvegarder le refresh token (hashé en prod, simplifié ici)
+    await this.prisma.user.update({
+      where: { id: updatedUser.id },
+      data: { refreshToken: tokens.refreshToken },
+    });
+
+    return {
+      ...tokens,
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        firstName: updatedUser.firstName,
+        lastName: updatedUser.lastName,
+        avatarUrl: updatedUser.avatarUrl,
+        role: updatedUser.role,
+        isVerified: updatedUser.isVerified,
+        language: updatedUser.language,
+        hasDriver: !!user.driver,
+        driverStatus: user.driver?.status ?? null,
+      },
+      isNewUser,
+    };
+  }
+
+  // ─── Refresh token ────────────────────────────────────────────────────────
+  async refreshTokens(userId: string, refreshToken: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, role: true, refreshToken: true, isActive: true },
+    });
+
+    if (!user || !user.isActive || user.refreshToken !== refreshToken) {
+      throw new UnauthorizedException('Session expirée. Veuillez vous reconnecter.');
+    }
+
+    const tokens = await this.generateTokens(user.id, user.email, user.role);
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { refreshToken: tokens.refreshToken },
+    });
+
+    return tokens;
+  }
+
+  // ─── Logout ───────────────────────────────────────────────────────────────
+  async logout(userId: string): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { refreshToken: null, fcmToken: null },
+    });
+  }
+
+  // ─── Mise à jour FCM token ────────────────────────────────────────────────
+  async updateFcmToken(userId: string, fcmToken: string): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { fcmToken },
+    });
+  }
+
+  // ─── Génération des tokens JWT ────────────────────────────────────────────
+  private async generateTokens(userId: string, email: string, role: string) {
+    const payload = { sub: userId, email, role };
+
+    const [accessToken, refreshToken] = await Promise.all([
+      this.jwt.signAsync(payload, {
+        secret: this.config.get('JWT_ACCESS_SECRET'),
+        expiresIn: this.config.get('JWT_ACCESS_EXPIRES_IN', '15m'),
+      }),
+      this.jwt.signAsync(payload, {
+        secret: this.config.get('JWT_REFRESH_SECRET'),
+        expiresIn: this.config.get('JWT_REFRESH_EXPIRES_IN', '30d'),
+      }),
+    ]);
+
+    return { accessToken, refreshToken };
+  }
+}

@@ -1,0 +1,20 @@
+import { ExecutionContext } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+export declare const IS_PUBLIC_KEY = "isPublic";
+declare const JwtAuthGuard_base: import("@nestjs/passport").Type<import("@nestjs/passport").IAuthGuard>;
+export declare class JwtAuthGuard extends JwtAuthGuard_base {
+    private reflector;
+    constructor(reflector: Reflector);
+    canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean>;
+    handleRequest(err: any, user: any): any;
+}
+import { CanActivate } from '@nestjs/common';
+import { Observable } from 'rxjs';
+export declare const Roles: (...roles: string[]) => (target: any, key?: string, descriptor?: any) => any;
+export declare class RolesGuard implements CanActivate {
+    private reflector;
+    constructor(reflector: Reflector);
+    canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean>;
+}
+export declare const Public: () => import("@nestjs/common").CustomDecorator<string>;
+export {};
